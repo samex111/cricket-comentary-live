@@ -1,0 +1,1 @@
+{"name":"@cricket/providers","private":true,"type":"module","exports":{"./crypto":"./src/crypto.ts","./google":"./src/google.ts","./drive":"./src/drive.ts","./video":"./src/video.ts","./gemini":"./src/gemini.ts","./tts":"./src/tts.ts"},"dependencies":{"@google/genai":"^1.30.0","googleapis":"^160.0.0","@cricket/database":"*","@cricket/shared":"*"}}
