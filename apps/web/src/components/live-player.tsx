@@ -115,14 +115,18 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
       ? wavBlob(resample(joined, audioContextRef.current?.sampleRate ?? 48000, 16000), 16000).arrayBuffer()
       : Promise.resolve(null);
     void audioPromise.then(wav => {
-      if (!wav || video.paused || !socket.connected) return;
-      const bytes = new Uint8Array(wav);
-      let binary = "";
-      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      if (video.paused || !socket.connected) return;
+      let audioWavBase64: string | undefined;
+      if (wav) {
+        const bytes = new Uint8Array(wav);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        audioWavBase64 = btoa(binary);
+      }
       socket.emit("media:window", {
         epoch: epochRef.current, startMs: firstTimestamp, endMs,
         frames: frames.filter(frame => frame.timestampMs >= firstTimestamp && frame.timestampMs <= endMs),
-        audioWavBase64: btoa(binary),
+        ...(audioWavBase64 ? { audioWavBase64 } : {}),
       }, (ack: { accepted: boolean; reason?: string }) => {
         setMessage(ack?.accepted ? "Gemini analysing synchronized audio + video" : (ack?.reason ?? "Window skipped"));
       });

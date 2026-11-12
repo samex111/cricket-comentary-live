@@ -106,6 +106,7 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       if (window.epoch !== session.epoch || window.epoch !== runtime.epoch) { ack?.({ accepted: false, reason: "Stale playback epoch" }); return; }
       if (runtime.inFlight) { ack?.({ accepted: false, reason: "Inference busy; drop this window" }); return; }
       runtime.inFlight = true;
+      await prisma.playbackSession.update({ where: { id: sessionId }, data: { currentPositionMs: window.endMs, lastHeartbeatAt: new Date() } });
       ack?.({ accepted: true });
       try {
         const candidates = await analyzeRealtimeWindow({
@@ -133,7 +134,13 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
           if (event.status !== "DETECTED") continue;
           runtime.recentEvents.push({ timestampMs: startMs, eventType: approved.eventType, summary: approved.observation });
           runtime.recentEvents = runtime.recentEvents.slice(-12);
-          const audio = await speak(approved.commentaryText, approved.emotion);
+          let audio: Buffer;
+          try {
+            audio = await speak(approved.commentaryText, approved.emotion);
+          } catch (error) {
+            await prisma.playbackEvent.update({ where: { id: event.id }, data: { status: "FAILED" } });
+            throw error;
+          }
           const latest = await prisma.playbackSession.findUnique({ where: { id: sessionId } });
           if (!latest || latest.status !== "PLAYING" || latest.epoch !== window.epoch || runtime.epoch !== window.epoch) {
             await prisma.playbackEvent.update({ where: { id: event.id }, data: { status: "SUPPRESSED" } }).catch(() => undefined);
