@@ -1,0 +1,2 @@
+import {describe,it,expect} from "vitest";import {planChunks} from "@cricket/providers/video";
+describe("chunk planner",()=>{it("covers short clip once",()=>expect(planChunks(12,30,2)).toEqual([{index:0,startSeconds:0,endSeconds:12}]));it("uses overlap and covers final tail",()=>{const c=planChunks(65,30,2);expect(c).toHaveLength(3);expect(c[1]?.startSeconds).toBe(28);expect(c[2]?.endSeconds).toBe(65);});it("rejects invalid ranges",()=>expect(()=>planChunks(0,30,2)).toThrow());it("avoids an unnecessary trailing chunk",()=>expect(planChunks(58,30,2)).toHaveLength(2));});

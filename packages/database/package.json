@@ -1,0 +1,1 @@
+{"name":"@cricket/database","private":true,"type":"module","exports":{".":"./src/index.ts"},"dependencies":{"@prisma/client":"^6.19.0"}}

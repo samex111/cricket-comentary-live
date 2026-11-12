@@ -1,0 +1,8 @@
+import { z } from "zod";
+export const EVENT_TYPES=["DELIVERY","SHOT","DEFENSIVE_SHOT","DOT_BALL","SINGLE","TWO_RUNS","THREE_RUNS","BOUNDARY_FOUR","SIX","WICKET","CATCH","RUN_OUT","REPLAY","APPEAL","UNKNOWN"] as const;
+export const EMOTIONS=["neutral","controlled","excited","high_excitement","dramatic","suspenseful"] as const;
+export const commentaryEventSchema=z.object({startSeconds:z.number().finite().min(0),endSeconds:z.number().finite().min(0),eventType:z.enum(EVENT_TYPES),observation:z.string().trim().min(1).max(500),commentaryText:z.string().trim().min(1).max(700),emotion:z.enum(EMOTIONS).default("neutral"),confidence:z.number().finite().min(0).max(1).default(.5)}).refine(e=>e.endSeconds>=e.startSeconds,{path:["endSeconds"],message:"endSeconds must not precede startSeconds"});
+export const commentaryResponseSchema=z.object({events:z.array(commentaryEventSchema).max(100)});
+export const analyzeRequestSchema=z.object({fps:z.number().min(.5).max(8).default(2),chunkSeconds:z.number().int().min(10).max(120).default(30),overlapSeconds:z.number().min(0).max(10).default(2),generateAudio:z.boolean().default(true)}).refine(v=>v.overlapSeconds<v.chunkSeconds,{path:["overlapSeconds"],message:"overlap must be shorter than chunk"});
+export type CommentaryEvent=z.infer<typeof commentaryEventSchema>;
+export type RealtimeEvent={type:"job.progress";payload:{videoId:string;jobId:string;progress:number;stage:string}}|{type:"segment.created";payload:{videoId:string;segment:unknown}}|{type:"audio.ready";payload:{videoId:string;segmentId:string}}|{type:"job.completed";payload:{videoId:string;jobId:string}}|{type:"job.failed";payload:{videoId:string;jobId:string;message:string}};
