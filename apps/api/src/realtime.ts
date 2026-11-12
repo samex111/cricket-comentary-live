@@ -31,6 +31,18 @@ type Runtime = {
   transcriptStartedAtMs: number;
   audioSequence: number;
   recentVision: Array<{ timestampMs: number; type: string; confidence: number; evidence?: Record<string, number> }>;
+  metricsStartedAt: number;
+  lastMetricsEmitAt: number;
+  metrics: {
+    audioChunksIn: number;
+    audioBytesIn: number;
+    geminiVideoFramesIn: number;
+    visionFramesIn: number;
+    visionCandidates: number;
+    visionInferenceMsLast: number;
+    audioChunksOut: number;
+    reconnects: number;
+  };
 };
 
 const runtimes = new Map<string, Runtime>();
@@ -62,6 +74,18 @@ function runtimeFor(id: string, epoch: number, status: Status, positionMs = 0): 
       transcriptStartedAtMs: 0,
       audioSequence: 0,
       recentVision: [],
+      metricsStartedAt: Date.now(),
+      lastMetricsEmitAt: 0,
+      metrics: {
+        audioChunksIn: 0,
+        audioBytesIn: 0,
+        geminiVideoFramesIn: 0,
+        visionFramesIn: 0,
+        visionCandidates: 0,
+        visionInferenceMsLast: 0,
+        audioChunksOut: 0,
+        reconnects: 0,
+      },
     };
     runtimes.set(id, value);
   }
@@ -114,6 +138,19 @@ function isCurrent(runtime: Runtime, generation: number, epoch: number): boolean
 
 function emitLiveError(io: Server, sessionId: string, message: string) {
   io.to(room(sessionId)).emit("live:error", { message });
+}
+
+function emitMetrics(io: Server, sessionId: string, runtime: Runtime, force = false) {
+  const now = Date.now();
+  if (!force && now - runtime.lastMetricsEmitAt < 2_000) return;
+  runtime.lastMetricsEmitAt = now;
+  io.to(room(sessionId)).emit("live:metrics", {
+    epoch: runtime.epoch,
+    uptimeMs: now - runtime.metricsStartedAt,
+    lastAudioInputAgeMs: runtime.lastAudioInputAt ? now - runtime.lastAudioInputAt : null,
+    ...runtime.metrics,
+    emittedAtMs: now,
+  });
 }
 
 async function persistTranscript(sessionId: string, runtime: Runtime, io: Server) {
@@ -197,6 +234,7 @@ async function openLiveSession(sessionId: string, io: Server): Promise<void> {
           onAudio: (pcm24k) => {
             if (!isCurrent(runtime, generation, epoch)) return;
             runtime.audioSequence += 1;
+            runtime.metrics.audioChunksOut += 1;
             io.to(room(sessionId)).emit("live:audio", {
               epoch,
               sequence: runtime.audioSequence,
@@ -289,6 +327,7 @@ async function openLiveSession(sessionId: string, io: Server): Promise<void> {
     runtime.reconnectAttempts = 0;
     if (runtime.reconnectTimer) clearTimeout(runtime.reconnectTimer);
     runtime.reconnectTimer = undefined;
+    emitMetrics(io, sessionId, runtime, true);
     io.to(room(sessionId)).emit("live:status", {
       state: "connected",
       model: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live",
@@ -498,6 +537,8 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       const pcm = asBuffer(raw);
       if (!pcm || pcm.length < 160 || pcm.length > MAX_AUDIO_CHUNK_BYTES || pcm.length % 2 !== 0) return;
       runtime.lastAudioInputAt = Date.now();
+      runtime.metrics.audioChunksIn += 1;
+      runtime.metrics.audioBytesIn += pcm.length;
       try {
         runtime.live.sendAudio(pcm);
       } catch (error) {
@@ -512,6 +553,7 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       if (!jpeg) return;
       if (Date.now() - runtime.lastGeminiVideoAt < GEMINI_VIDEO_INTERVAL_MS) return;
       runtime.lastGeminiVideoAt = Date.now();
+      runtime.metrics.geminiVideoFramesIn += 1;
       try {
         runtime.live.sendContext(`Visual context frame at match time ${(payload.timestampMs / 1000).toFixed(2)} seconds.`);
         runtime.live.sendVideo(jpeg);
@@ -528,9 +570,14 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       if (!jpeg) return;
       runtime.visionBusy = true;
       runtime.lastVisionAt = Date.now();
+      runtime.metrics.visionFramesIn += 1;
       try {
         const result = await analyzeCricketFrame(sessionId, payload.timestampMs, jpeg);
-        if (result && runtime.status === "PLAYING") sendVisionContext(sessionId, runtime, io, result);
+        if (result && runtime.status === "PLAYING") {
+          runtime.metrics.visionInferenceMsLast = result.inferenceMs;
+          runtime.metrics.visionCandidates += result.candidateEvents.length;
+          sendVisionContext(sessionId, runtime, io, result);
+        }
       } catch (error) {
         socket.emit("live:vision-status", {
           available: false,
@@ -551,6 +598,7 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       if (typeof value.playbackRate === "number" && Number.isFinite(value.playbackRate)) {
         runtime.playbackRate = Math.min(2, Math.max(0.25, value.playbackRate));
       }
+      emitMetrics(io, sessionId, runtime);
       if (Date.now() - runtime.lastDatabaseSyncAt > 3_000) {
         runtime.lastDatabaseSyncAt = Date.now();
         void prisma.playbackSession.update({
