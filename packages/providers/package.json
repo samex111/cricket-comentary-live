@@ -8,7 +8,8 @@
     "./drive": "./src/drive.ts",
     "./video": "./src/video.ts",
     "./gemini": "./src/gemini.ts",
-    "./tts": "./src/tts.ts"
+    "./tts": "./src/tts.ts",
+    "./realtime": "./src/realtime.ts"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",

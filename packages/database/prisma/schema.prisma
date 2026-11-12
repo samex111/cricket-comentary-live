@@ -40,6 +40,21 @@ enum AudioStatus {
   DISABLED
 }
 
+enum PlaybackSessionStatus {
+  READY
+  PLAYING
+  PAUSED
+  STOPPED
+  FAILED
+}
+
+enum PlaybackEventStatus {
+  DETECTED
+  SPOKEN
+  SUPPRESSED
+  FAILED
+}
+
 model GoogleConnection {
   id              String   @id
   encryptedTokens String
@@ -51,21 +66,22 @@ model GoogleConnection {
 }
 
 model Video {
-  id              String              @id @default(uuid())
-  title           String
-  originalName    String
-  mimeType        String
-  sizeBytes       BigInt
-  durationMs      Int?
-  driveFileId     String?             @unique
-  driveWebViewUrl String?
-  status          VideoStatus         @default(UPLOADING)
-  failureReason   String?
-  createdAt       DateTime            @default(now())
-  updatedAt       DateTime            @updatedAt
-  jobs            AnalysisJob[]
-  chunks          VideoChunk[]
-  segments        CommentarySegment[]
+  id               String              @id @default(uuid())
+  title            String
+  originalName     String
+  mimeType         String
+  sizeBytes        BigInt
+  durationMs       Int?
+  driveFileId      String?             @unique
+  driveWebViewUrl  String?
+  status           VideoStatus         @default(UPLOADING)
+  failureReason    String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  jobs             AnalysisJob[]
+  chunks           VideoChunk[]
+  segments         CommentarySegment[]
+  playbackSessions PlaybackSession[]
 
   @@index([createdAt])
 }
@@ -141,4 +157,40 @@ model AudioAsset {
   sizeBytes   BigInt
   durationMs  Int?
   createdAt   DateTime          @default(now())
+}
+
+model PlaybackSession {
+  id                String                @id @default(uuid())
+  videoId           String
+  video             Video                 @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  status            PlaybackSessionStatus @default(READY)
+  currentPositionMs Int                   @default(0)
+  epoch             Int                   @default(0)
+  startedAt         DateTime              @default(now())
+  pausedAt          DateTime?
+  endedAt           DateTime?
+  lastHeartbeatAt   DateTime              @default(now())
+  events            PlaybackEvent[]
+
+  @@index([videoId, startedAt])
+  @@index([status, lastHeartbeatAt])
+}
+
+model PlaybackEvent {
+  id             String              @id @default(uuid())
+  sessionId      String
+  session        PlaybackSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  epoch          Int
+  dedupeKey      String              @unique
+  eventType      String
+  startMs        Int
+  endMs          Int
+  commentaryText String
+  confidence     Float
+  visualEvidence String?
+  audioEvidence  String?
+  status         PlaybackEventStatus @default(DETECTED)
+  createdAt      DateTime            @default(now())
+
+  @@index([sessionId, epoch, startMs])
 }
