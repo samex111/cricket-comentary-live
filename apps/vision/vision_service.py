@@ -21,7 +21,8 @@ MAX_FRAME_BYTES = 512_000
 
 app = FastAPI(title="Boundary Cricket Vision", version="0.1.0")
 _model: YOLO | None = None
-_model_lock = threading.Lock()
+_model_load_lock = threading.Lock()
+_inference_lock = threading.Lock()
 _state_lock = threading.Lock()
 
 
@@ -47,7 +48,7 @@ def angle_change_degrees(old_v: tuple[float, float], new_v: tuple[float, float])
 def get_model() -> YOLO:
     global _model
     if _model is None:
-        with _model_lock:
+        with _model_load_lock:
             if _model is None:
                 _model = YOLO(MODEL_NAME)
     return _model
@@ -134,18 +135,19 @@ async def detect_frame(
 
     started = time.perf_counter()
     try:
-        # Inference is serialized because the YOLO model and its tracker state are shared.
-        with _model_lock:
-            model = get_model()
-            kwargs: dict[str, Any] = {
+        # Load outside the inference lock to avoid recursively acquiring the model-load lock.
+        model = get_model()
+        kwargs: dict[str, Any] = {
                 "source": image,
                 "imgsz": IMAGE_SIZE,
                 "conf": CONFIDENCE,
                 "classes": [0, 32],  # COCO: person and sports ball.
                 "verbose": False,
             }
-            if DEVICE != "auto":
-                kwargs["device"] = DEVICE
+        if DEVICE != "auto":
+            kwargs["device"] = DEVICE
+        # Inference is serialized because one model instance is shared across requests.
+        with _inference_lock:
             results = model.predict(**kwargs)
     except Exception as error:
         raise HTTPException(status_code=503, detail=f"Vision inference failed: {error}") from error
@@ -193,7 +195,12 @@ async def detect_frame(
 
 
 @app.delete("/sessions/{session_id}")
-def clear_session(session_id: str) -> dict[str, bool]:
+def clear_session(
+    session_id: str,
+    x_vision_key: str = Header(default="", alias="X-Vision-Key"),
+) -> dict[str, bool]:
+    if API_KEY and x_vision_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid vision service key")
     with _state_lock:
         _states.pop(session_id, None)
     return {"cleared": True}
