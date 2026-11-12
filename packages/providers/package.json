@@ -9,7 +9,8 @@
     "./video": "./src/video.ts",
     "./gemini": "./src/gemini.ts",
     "./tts": "./src/tts.ts",
-    "./realtime": "./src/realtime.ts"
+    "./realtime": "./src/realtime.ts",
+    "./gemini-live": "./src/gemini-live.ts"
   },
   "dependencies": {
     "@google/genai": "^2.3.0",
