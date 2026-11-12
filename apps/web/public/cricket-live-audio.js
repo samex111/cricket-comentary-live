@@ -91,10 +91,13 @@ class CricketLiveAudioProcessor extends AudioWorkletProcessor {
     this.capture(input, frameCount);
 
     for (let i = 0; i < frameCount; i++) {
+      const speechActive = Boolean(this.currentSpeech || this.speechQueue.length);
       const speech = this.nextSpeechSample();
+      const sourceGain = speechActive ? 0.32 : 1;
       for (let channel = 0; channel < output.length; channel++) {
         const matchAudio = (input[channel] || input[0])?.[i] || 0;
-        output[channel][i] = Math.max(-1, Math.min(1, matchAudio + speech));
+        // Duck the source broadcast while AI speech is present, without muting it.
+        output[channel][i] = Math.max(-1, Math.min(1, matchAudio * sourceGain + speech * 0.82));
       }
     }
     return true;
