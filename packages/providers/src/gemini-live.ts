@@ -65,6 +65,15 @@ export async function connectGeminiLive(options: ConnectGeminiLiveOptions): Prom
 
   const config = {
     responseModalities: ["AUDIO"],
+    generationConfig: {
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: options.voiceName ?? process.env.GEMINI_LIVE_VOICE ?? "Kore",
+          },
+        },
+      },
+    },
     systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
     outputAudioTranscription: {},
     sessionResumption: {
@@ -95,16 +104,18 @@ export async function connectGeminiLive(options: ConnectGeminiLiveOptions): Prom
           goAway?: { timeLeft?: string };
         };
         const content = msg.serverContent;
+        let fallbackText = "";
         if (content?.modelTurn?.parts) {
           for (const part of content.modelTurn.parts) {
             const audio = part.inlineData?.data;
             if (audio) options.callbacks.onAudio(Buffer.from(audio, "base64"));
-            // Some Live API model revisions include text parts alongside audio.
-            if (part.text?.trim()) options.callbacks.onText(part.text.trim());
+            if (part.text?.trim()) fallbackText += (fallbackText ? " " : "") + part.text.trim();
           }
         }
-        const transcript = content?.outputTranscription?.text;
-        if (transcript?.trim()) options.callbacks.onText(transcript);
+        // Prefer the dedicated audio transcription stream; part.text is a fallback only.
+        const transcript = content?.outputTranscription?.text?.trim();
+        if (transcript) options.callbacks.onText(transcript);
+        else if (fallbackText) options.callbacks.onText(fallbackText);
         if (content?.interrupted) options.callbacks.onInterrupted();
         if (content?.generationComplete || content?.turnComplete) options.callbacks.onGenerationComplete();
 
