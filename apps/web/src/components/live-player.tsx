@@ -36,7 +36,7 @@ function resample(input: Float32Array, sourceRate: number, targetRate: number) {
     const start = Math.floor(i * ratio);
     const end = Math.min(input.length, Math.floor((i + 1) * ratio));
     let sum = 0;
-    for (let j = start; j < end; j++) sum += input[j];
+    for (let j = start; j < end; j++) sum += input[j] ?? 0;
     output[i] = sum / Math.max(1, end - start);
   }
   return output;
@@ -104,12 +104,13 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     if (!video || video.paused || status !== "PLAYING" || !socket?.connected || !sessionRef.current) return;
     const frames = framesRef.current.splice(0, 6);
     const audioBlocks = audioBlocksRef.current.splice(0);
-    if (!frames.length) return;
+    const firstFrame = frames[0];
+    if (!firstFrame) return;
     const sampleCount = audioBlocks.reduce((sum, block) => sum + block.samples.length, 0);
     const joined = new Float32Array(sampleCount);
     let offset = 0;
     for (const block of audioBlocks) { joined.set(block.samples, offset); offset += block.samples.length; }
-    const firstTimestamp = Math.min(frames[0].timestampMs, audioBlocks[0]?.timestampMs ?? frames[0].timestampMs);
+    const firstTimestamp = Math.min(firstFrame.timestampMs, audioBlocks[0]?.timestampMs ?? firstFrame.timestampMs);
     const endMs = Math.max(firstTimestamp + 1, Math.round(video.currentTime * 1000));
     const audioPromise = sampleCount
       ? wavBlob(resample(joined, audioContextRef.current?.sampleRate ?? 48000, 16000), 16000).arrayBuffer()
@@ -183,7 +184,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
           canvas.width = width; canvas.height = height;
           canvas.getContext("2d")?.drawImage(video, 0, 0, width, height);
           const jpegBase64 = canvas.toDataURL("image/jpeg", 0.65).split(",")[1];
-          framesRef.current.push({ timestampMs, jpegBase64 });
+          if (jpegBase64) framesRef.current.push({ timestampMs, jpegBase64 });
           if (framesRef.current.length > 8) framesRef.current.shift();
           lastCaptureMs = timestampMs;
         }
