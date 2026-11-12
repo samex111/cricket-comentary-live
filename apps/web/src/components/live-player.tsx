@@ -154,7 +154,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
         });
         socket.on("commentary:audio", (event: AudioMessage) => {
           const video = videoRef.current;
-          if (event.epoch !== epochRef.current || !video || event.startMs < video.currentTime * 1000 - 8000) return;
+          if (event.epoch !== epochRef.current || !video || video.paused || event.startMs < video.currentTime * 1000 - 8000) return;
           const url = URL.createObjectURL(new Blob([event.audio as BlobPart], { type: "audio/wav" }));
           urlsRef.current.push(url); queueRef.current.push(url); playQueuedSpeech();
         });
@@ -176,7 +176,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     let lastCaptureMs = -500;
     const onFrame = (_now: number, metadata: { mediaTime: number }) => {
       const timestampMs = Math.round(metadata.mediaTime * 1000);
-      if (!video.paused && status === "PLAYING" && timestampMs - lastCaptureMs >= 500) {
+      if (!video.paused && status === "PLAYING" && timestampMs - lastCaptureMs >= 333) {
         const canvas = canvasRef.current;
         if (canvas) {
           const width = Math.min(640, video.videoWidth || 640);
