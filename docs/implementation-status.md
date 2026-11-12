@@ -21,3 +21,11 @@
 - Add range-stream correctness and real provider integration tests
 - Add upload cancellation, codec validation, retention and temp-file cleanup
 - Review security before exposing the unauthenticated dashboard/API publicly
+
+
+## Commentary quality gate
+- A separate commentary-director package sits between Gemini event extraction and persistence.
+- Routine delivery/shot/appeal/replay observations are suppressed from the spoken feed.
+- SIX, WICKET, CATCH and RUN_OUT require at least 0.90 model confidence; boundary fours require 0.85.
+- Event type sets a conservative delivery emotion for defensive shots, boundaries and wickets.
+- These thresholds are heuristic safeguards, not measured accuracy. Tune them only against a labelled clip set.
