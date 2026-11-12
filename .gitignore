@@ -9,3 +9,8 @@ coverage
 .tmp
 uploads
 *.tsbuildinfo
+# Local Python vision sidecar
+.venv/
+__pycache__/
+*.py[cod]
+*.pt
