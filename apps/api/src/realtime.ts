@@ -25,6 +25,7 @@ type Runtime = {
   connectionGeneration: number;
   reconnectAttempts: number;
   reconnectTimer?: NodeJS.Timeout;
+  clientDisconnectTimer?: NodeJS.Timeout;
   resumeHandle?: string;
   transcript: string;
   transcriptStartMs: number;
@@ -306,7 +307,7 @@ async function openLiveSession(sessionId: string, io: Server): Promise<void> {
 
     let connection: GeminiLiveConnection;
     try {
-      connection = await connect(sessionRecord.liveSessionHandle ?? runtime.resumeHandle);
+      connection = await connect(runtime.resumeHandle ?? sessionRecord.liveSessionHandle);
     } catch (error) {
       const handle = sessionRecord.liveSessionHandle ?? runtime.resumeHandle;
       if (!handle) throw error;
@@ -332,7 +333,7 @@ async function openLiveSession(sessionId: string, io: Server): Promise<void> {
       state: "connected",
       model: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live",
       epoch,
-      resumed: Boolean(sessionRecord.liveSessionHandle ?? runtime.resumeHandle),
+      resumed: Boolean(runtime.resumeHandle ?? sessionRecord.liveSessionHandle),
     });
     connection.sendContext(
       `Live match commentary started at match clock ${Math.floor(runtime.positionMs / 60_000)}:${String(Math.floor(runtime.positionMs / 1000) % 60).padStart(2, "0")}. The incoming audio is the original match feed, not a microphone.`,
@@ -459,8 +460,10 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     if (!current || current.status === "STOPPED") return reply.code(404).send({ error: "Active session not found" });
     const runtime = runtimes.get(id);
     if (runtime?.reconnectTimer) clearTimeout(runtime.reconnectTimer);
+    if (runtime?.clientDisconnectTimer) clearTimeout(runtime.clientDisconnectTimer);
     if (runtime) {
       runtime.reconnectTimer = undefined;
+      runtime.clientDisconnectTimer = undefined;
       runtime.status = "PAUSED";
       runtime.connectionGeneration += 1;
       runtime.live?.close();
@@ -492,6 +495,7 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     if (!current) return reply.code(404).send({ error: "Playback session not found" });
     const runtime = runtimes.get(id);
     if (runtime?.reconnectTimer) clearTimeout(runtime.reconnectTimer);
+    if (runtime?.clientDisconnectTimer) clearTimeout(runtime.clientDisconnectTimer);
     if (runtime) {
       runtime.status = "STOPPED";
       runtime.connectionGeneration += 1;
@@ -522,6 +526,10 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       }
       const runtime = runtimeFor(session.id, session.epoch, session.status as Status, session.currentPositionMs);
       socket.join(room(session.id));
+      if (runtime.clientDisconnectTimer) {
+        clearTimeout(runtime.clientDisconnectTimer);
+        runtime.clientDisconnectTimer = undefined;
+      }
       socket.emit("playback:ready", {
         sessionId,
         epoch: session.epoch,
@@ -611,9 +619,32 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     socket.on("disconnect", () => {
       // Keep the server-side Live session alive briefly so a transient browser reconnect can resume the same match context.
       const runtime = runtimes.get(sessionId);
-      if (runtime && runtime.status === "PLAYING") {
-        io.to(room(sessionId)).emit("live:status", { state: "client-disconnected" });
-      }
+      if (!runtime || runtime.status !== "PLAYING" || runtime.clientDisconnectTimer) return;
+      io.to(room(sessionId)).emit("live:status", { state: "client-disconnected" });
+      runtime.clientDisconnectTimer = setTimeout(() => {
+        runtime.clientDisconnectTimer = undefined;
+        void (async () => {
+          const remainingSockets = await io.in(room(sessionId)).fetchSockets().catch(() => []);
+          if (remainingSockets.length > 0 || runtime.status !== "PLAYING") return;
+          runtime.status = "PAUSED";
+          runtime.connectionGeneration += 1;
+          runtime.live?.close();
+          runtime.live = undefined;
+          runtime.transcript = "";
+          await prisma.playbackSession.update({
+            where: { id: sessionId },
+            data: {
+              status: "PAUSED",
+              currentPositionMs: runtime.positionMs,
+              pausedAt: new Date(),
+              lastHeartbeatAt: new Date(),
+            },
+          }).catch(() => undefined);
+          // Resumption handle remains persisted in Prisma; dropping the runtime releases memory.
+          if (runtimes.get(sessionId) === runtime) runtimes.delete(sessionId);
+        })();
+      }, 30_000);
+      runtime.clientDisconnectTimer.unref?.();
     });
   });
 }
