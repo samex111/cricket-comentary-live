@@ -437,18 +437,26 @@ export default function Home() {
               </h1>
             </div>
             {selected && (
-              <button
-                onClick={() => void start()}
-                disabled={busy || !connected || isSelectedAnalyzing}
-                className="flex items-center gap-2 rounded-lg bg-white px-4 py-2.5 text-xs font-semibold text-black disabled:opacity-40"
-              >
-                {busy || isSelectedAnalyzing ? (
-                  <LoaderCircle className="animate-spin" size={15} />
-                ) : (
-                  <Radio size={15} />
-                )}
-                {isSelectedAnalyzing ? "Analyzing..." : "Start AI commentary"}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <a
+                  href={`/live/${selected.id}`}
+                  className="rounded-lg border border-[#555] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#1b1b1b]"
+                >
+                  Live multimodal mode
+                </a>
+                <button
+                  onClick={() => void start()}
+                  disabled={busy || !connected || isSelectedAnalyzing}
+                  className="flex items-center gap-2 rounded-lg bg-white px-4 py-2.5 text-xs font-semibold text-black disabled:opacity-40"
+                >
+                  {busy || isSelectedAnalyzing ? (
+                    <LoaderCircle className="animate-spin" size={15} />
+                  ) : (
+                    <Radio size={15} />
+                  )}
+                  {isSelectedAnalyzing ? "Analyzing..." : "Start AI commentary"}
+                </button>
+              </div>
             )}
           </div>
 
