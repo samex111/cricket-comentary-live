@@ -49,7 +49,24 @@ export async function analyzeRealtimeWindow(input: {
   const first = raw.indexOf("{");
   const last = raw.lastIndexOf("}");
   if (first < 0 || last <= first) throw new Error("Gemini returned no structured event response");
-  const parsed = commentaryResponseSchema.safeParse(JSON.parse(raw.slice(first, last + 1)));
+  const decoded = JSON.parse(raw.slice(first, last + 1)) as { events?: unknown };
+  // Gemini sometimes serializes numeric JSON fields as strings despite JSON mode.
+  // Normalize numeric strings at the provider boundary, then keep the shared schema strict.
+  if (decoded && Array.isArray(decoded.events)) {
+    decoded.events = decoded.events.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+      const event = item as Record<string, unknown>;
+      for (const key of ["startSeconds", "endSeconds", "confidence"]) {
+        const value = event[key];
+        if (typeof value === "string" && value.trim() !== "") {
+          const numeric = Number(value.trim());
+          if (Number.isFinite(numeric)) event[key] = numeric;
+        }
+      }
+      return event;
+    });
+  }
+  const parsed = commentaryResponseSchema.safeParse(decoded);
   if (!parsed.success) throw new Error("Invalid realtime Gemini response: " + parsed.error.message);
   return parsed.data.events;
 }
