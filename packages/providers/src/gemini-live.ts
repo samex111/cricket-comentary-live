@@ -65,12 +65,10 @@ export async function connectGeminiLive(options: ConnectGeminiLiveOptions): Prom
 
   const config = {
     responseModalities: ["AUDIO"],
-    generationConfig: {
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: {
-            voiceName: options.voiceName ?? process.env.GEMINI_LIVE_VOICE ?? "Kore",
-          },
+    speechConfig: {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: options.voiceName ?? process.env.GEMINI_LIVE_VOICE ?? "Kore",
         },
       },
     },
