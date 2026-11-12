@@ -25,7 +25,7 @@ type LiveAudioMessage = {
   generatedAtMs: number;
   audio: ArrayBuffer | Uint8Array | number[] | { type: "Buffer"; data: number[] };
 };
-type LiveStatus = "READY" | "PLAYING" | "PAUSED" | "STOPPED" | "CONNECTING" | "RECONNECTING";
+type LiveStatus = "READY" | "PLAYING" | "PAUSED" | "STOPPED" | "CONNECTING" | "RECONNECTING" | "FAILED";
 type WorkletMessage = { type: "audio"; pcm: ArrayBuffer };
 
 const clock = (ms: number) => {
@@ -219,7 +219,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
         });
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Session initialization failed");
-        setLiveStatus("FAILED" as LiveStatus);
+        setLiveStatus("FAILED");
       }
     })();
     return () => {
