@@ -9,10 +9,11 @@
     "./video": "./src/video.ts",
     "./gemini": "./src/gemini.ts",
     "./tts": "./src/tts.ts",
-    "./realtime": "./src/realtime.ts"
+    "./realtime": "./src/realtime.ts",
+    "./gemini-live": "./src/gemini-live.ts"
   },
   "dependencies": {
-    "@google/genai": "^1.30.0",
+    "@google/genai": "^2.3.0",
     "googleapis": "^160.0.0",
     "@cricket/database": "*",
     "@cricket/shared": "*"

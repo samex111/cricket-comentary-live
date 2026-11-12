@@ -170,6 +170,9 @@ model PlaybackSession {
   pausedAt          DateTime?
   endedAt           DateTime?
   lastHeartbeatAt   DateTime              @default(now())
+  liveSessionHandle String?               @db.Text
+  liveSessionModel  String?
+  liveHandleUpdatedAt DateTime?
   events            PlaybackEvent[]
 
   @@index([videoId, startedAt])
