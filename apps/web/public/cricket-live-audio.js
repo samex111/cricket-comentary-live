@@ -51,7 +51,7 @@ class CricketLiveAudioProcessor extends AudioWorkletProcessor {
       if (!this.currentSpeech) return 0;
     }
 
-    const index = this.speechOffset;
+    const index = Math.floor(this.speechOffset);
     const nextIndex = Math.min(index + 1, this.currentSpeech.length - 1);
     const fraction = this.speechOffset - index;
     const sample = this.currentSpeech[index] * (1 - fraction) + this.currentSpeech[nextIndex] * fraction;
@@ -90,13 +90,11 @@ class CricketLiveAudioProcessor extends AudioWorkletProcessor {
     const frameCount = output[0]?.length || 128;
     this.capture(input, frameCount);
 
-    for (let channel = 0; channel < output.length; channel++) {
-      const target = output[channel];
-      const source = input[channel] || input[0];
-      for (let i = 0; i < frameCount; i++) {
-        const matchAudio = source?.[i] || 0;
-        const speech = this.nextSpeechSample();
-        target[i] = Math.max(-1, Math.min(1, matchAudio + speech));
+    for (let i = 0; i < frameCount; i++) {
+      const speech = this.nextSpeechSample();
+      for (let channel = 0; channel < output.length; channel++) {
+        const matchAudio = (input[channel] || input[0])?.[i] || 0;
+        output[channel][i] = Math.max(-1, Math.min(1, matchAudio + speech));
       }
     }
     return true;
