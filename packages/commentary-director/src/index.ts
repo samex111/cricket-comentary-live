@@ -7,8 +7,8 @@ import type { CommentaryEvent } from "@cricket/shared";
  */
 const MIN_CONFIDENCE: Record<string, number> = {
   DELIVERY: 1.01,
-  SHOT: 1.01,
-  APPEAL: 1.01,
+  SHOT: 0.8,
+  APPEAL: 0.8,
   REPLAY: 1.01,
   UNKNOWN: 1.01,
   DEFENSIVE_SHOT: 0.8,

@@ -102,7 +102,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     const video = videoRef.current;
     const socket = socketRef.current;
     if (!video || video.paused || status !== "PLAYING" || !socket?.connected || !sessionRef.current) return;
-    const frames = framesRef.current.splice(0, 6);
+    const frames = framesRef.current.splice(0, 5);
     const audioBlocks = audioBlocksRef.current.splice(0);
     const firstFrame = frames[0];
     if (!firstFrame) return;
@@ -111,7 +111,10 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     let offset = 0;
     for (const block of audioBlocks) { joined.set(block.samples, offset); offset += block.samples.length; }
     const firstTimestamp = Math.min(firstFrame.timestampMs, audioBlocks[0]?.timestampMs ?? firstFrame.timestampMs);
-    const endMs = Math.max(firstTimestamp + 1, Math.round(video.currentTime * 1000));
+    const maxFrameMs = frames.reduce((max, frame) => Math.max(max, frame.timestampMs), 0);
+    const endMs = Math.max(firstTimestamp + 1, maxFrameMs, Math.round(video.currentTime * 1000));
+    const boundedFrames = frames.filter(frame => frame.timestampMs >= firstTimestamp && frame.timestampMs <= endMs);
+    if (!boundedFrames.length) return;
     const audioPromise = sampleCount
       ? wavBlob(resample(joined, audioContextRef.current?.sampleRate ?? 48000, 16000), 16000).arrayBuffer()
       : Promise.resolve(null);
@@ -126,10 +129,14 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
       }
       socket.emit("media:window", {
         epoch: epochRef.current, startMs: firstTimestamp, endMs,
-        frames: frames.filter(frame => frame.timestampMs >= firstTimestamp && frame.timestampMs <= endMs),
+        frames: boundedFrames,
         ...(audioWavBase64 ? { audioWavBase64 } : {}),
-      }, (ack: { accepted: boolean; reason?: string }) => {
-        setMessage(ack?.accepted ? "Gemini analysing synchronized audio + video" : (ack?.reason ?? "Window skipped"));
+      }, (ack: { accepted: boolean; queued?: number; reason?: string }) => {
+        setMessage(
+          ack?.accepted
+            ? (ack.queued ? `Queued window #${ack.queued} (Gemini busy)` : "Gemini analysing synchronized audio + video")
+            : (ack?.reason ?? "Window skipped"),
+        );
       });
     });
   }, [status]);
@@ -147,10 +154,13 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
         sessionRef.current = session.id; epochRef.current = session.epoch;
         const socket = io(API.replace(/\/v1$/, ""), { auth: { sessionId: session.id }, transports: ["websocket"] });
         socketRef.current = socket;
-        socket.on("playback:ready", (data: { epoch: number; status: string }) => { epochRef.current = data.epoch; setStatus(data.status); setMessage("Session connected"); });
+        socket.on("playback:ready", (data: { epoch: number; status: string }) => { epochRef.current = data.epoch; setError(""); setStatus(data.status); setMessage("Session connected"); });
+        socket.on("playback:window:done", (data?: { queued?: number; durationMs?: number }) => {
+          setMessage(data?.queued ? `Processing queued window (${data.queued} waiting)` : `Window analysed (${data?.durationMs ?? 0}ms) · listening`);
+        });
         socket.on("playback:error", (data: { message: string }) => setError(data.message));
         socket.on("commentary:event", (event: FeedEvent) => {
-          if (event.epoch === epochRef.current) setEvents(old => [event, ...old].slice(0, 40));
+          if (event.epoch === epochRef.current) { setError(""); setEvents(old => [event, ...old].slice(0, 40)); }
         });
         socket.on("commentary:audio", (event: AudioMessage) => {
           const video = videoRef.current;
@@ -176,14 +186,14 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     let lastCaptureMs = -500;
     const onFrame = (_now: number, metadata: { mediaTime: number }) => {
       const timestampMs = Math.round(metadata.mediaTime * 1000);
-      if (!video.paused && status === "PLAYING" && timestampMs - lastCaptureMs >= 333) {
+      if (!video.paused && status === "PLAYING" && (timestampMs < lastCaptureMs || timestampMs - lastCaptureMs >= 333)) {
         const canvas = canvasRef.current;
         if (canvas) {
-          const width = Math.min(640, video.videoWidth || 640);
-          const height = Math.max(1, Math.round(width * (video.videoHeight || 360) / (video.videoWidth || 640)));
+          const width = Math.min(480, video.videoWidth || 480);
+          const height = Math.max(1, Math.round(width * (video.videoHeight || 360) / (video.videoWidth || 480)));
           canvas.width = width; canvas.height = height;
           canvas.getContext("2d")?.drawImage(video, 0, 0, width, height);
-          const jpegBase64 = canvas.toDataURL("image/jpeg", 0.65).split(",")[1];
+          const jpegBase64 = canvas.toDataURL("image/jpeg", 0.6).split(",")[1];
           if (jpegBase64) framesRef.current.push({ timestampMs, jpegBase64 });
           if (framesRef.current.length > 8) framesRef.current.shift();
           lastCaptureMs = timestampMs;
@@ -205,6 +215,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
   const play = async () => {
     const video = videoRef.current;
     if (!video || !sessionRef.current) return;
+    setError("");
     try {
       await connectAudioCapture();
       await audioContextRef.current?.resume();
@@ -244,7 +255,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
       <span className="text-xs text-neutral-400">{status} · {clock(positionMs)}</span>
     </header>
     <div className="overflow-hidden rounded-xl border border-neutral-800 bg-black">
-      <video ref={videoRef} crossOrigin="anonymous" playsInline src={`${API}/videos/${videoId}/stream`} className="aspect-video w-full" onTimeUpdate={event => setPositionMs(Math.round(event.currentTarget.currentTime * 1000))} onSeeking={() => void seek()} onEnded={() => void stop()} />
+      <video ref={videoRef} crossOrigin="anonymous" playsInline src={`${API}/videos/${videoId}/stream`} className="aspect-video w-full" onTimeUpdate={event => setPositionMs(Math.round(event.currentTarget.currentTime * 1000))} onSeeking={() => void seek()} onEnded={() => void pause()} />
     </div>
     <div className="flex flex-wrap gap-2">
       <button onClick={() => void play()} disabled={status === "STOPPED"} className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black">Play / Resume</button>
