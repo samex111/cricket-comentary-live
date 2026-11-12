@@ -1,177 +1,345 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Server, Socket } from "socket.io";
 import { prisma } from "@cricket/database";
-import { analyzeRealtimeWindow } from "@cricket/providers/realtime";
-import { speak } from "@cricket/providers/tts";
-import { decideCommentary } from "@cricket/commentary-director";
-import { realtimeWindowSchema, type RealtimeWindow } from "@cricket/shared";
+import {
+  connectGeminiLive,
+  type GeminiLiveConnection,
+} from "@cricket/providers/gemini-live";
+import { analyzeCricketFrame, clearVisionSession, type VisionFrameResult } from "./vision.js";
 
 type Status = "READY" | "PLAYING" | "PAUSED" | "STOPPED" | "FAILED";
-type QueuedWindow = { socket: Socket; window: RealtimeWindow };
 type Runtime = {
   epoch: number;
   status: Status;
-  inFlight: boolean;
-  pendingWindows: QueuedWindow[];
-  ttsQueue: Promise<void>;
-  recentEvents: Array<{ timestampMs: number; eventType: string; summary: string }>;
+  positionMs: number;
+  playbackRate: number;
+  lastDatabaseSyncAt: number;
+  lastAudioInputAt: number;
+  lastGeminiVideoAt: number;
+  lastVisionAt: number;
+  lastVisionSignalAt: number;
+  visionBusy: boolean;
+  live?: GeminiLiveConnection;
+  connecting: boolean;
+  connectionGeneration: number;
+  reconnectAttempts: number;
+  reconnectTimer?: NodeJS.Timeout;
+  resumeHandle?: string;
+  transcript: string;
+  transcriptStartMs: number;
+  transcriptStartedAtMs: number;
+  audioSequence: number;
+  recentVision: Array<{ timestampMs: number; type: string; confidence: number; evidence?: Record<string, number> }>;
 };
 
-const MAX_PENDING_WINDOWS = 6;
 const runtimes = new Map<string, Runtime>();
 const room = (id: string) => "playback:" + id;
+const MAX_AUDIO_CHUNK_BYTES = 16_384;
+const MAX_JPEG_BYTES = 512_000;
+const GEMINI_VIDEO_INTERVAL_MS = 950;
+const VISION_MIN_INTERVAL_MS = 85;
 
-const runtimeFor = (id: string, epoch: number, status: Status): Runtime => {
+function runtimeFor(id: string, epoch: number, status: Status, positionMs = 0): Runtime {
   let value = runtimes.get(id);
   if (!value) {
     value = {
       epoch,
       status,
-      inFlight: false,
-      pendingWindows: [],
-      ttsQueue: Promise.resolve(),
-      recentEvents: [],
+      positionMs,
+      playbackRate: 1,
+      lastDatabaseSyncAt: 0,
+      lastAudioInputAt: 0,
+      lastGeminiVideoAt: 0,
+      lastVisionAt: 0,
+      lastVisionSignalAt: 0,
+      visionBusy: false,
+      connecting: false,
+      connectionGeneration: 0,
+      reconnectAttempts: 0,
+      transcript: "",
+      transcriptStartMs: positionMs,
+      transcriptStartedAtMs: 0,
+      audioSequence: 0,
+      recentVision: [],
     };
     runtimes.set(id, value);
   }
   if (epoch > value.epoch) {
     value.epoch = epoch;
-    value.pendingWindows = [];
-    value.recentEvents = [];
+    value.transcript = "";
+    value.recentVision = [];
+    value.audioSequence = 0;
   }
   value.status = status;
-  if (status !== "PLAYING") value.pendingWindows = [];
+  value.positionMs = positionMs;
   return value;
-};
+}
 
-async function drainWindows(sessionId: string, io: Server) {
-  const runtime = runtimes.get(sessionId);
-  if (!runtime || runtime.inFlight) return;
-  runtime.inFlight = true;
-  try {
-    while (runtime.pendingWindows.length > 0) {
-      const next = runtime.pendingWindows.shift()!;
-      const { socket, window } = next;
-      if (!runtimes.has(sessionId) || runtime.status !== "PLAYING" || runtime.epoch !== window.epoch) {
-        continue;
-      }
-
-      const startedAt = Date.now();
-      let candidates;
-      try {
-        candidates = await analyzeRealtimeWindow({
-          startMs: window.startMs,
-          endMs: window.endMs,
-          frames: window.frames,
-          audioWav: window.audioWavBase64 ? Buffer.from(window.audioWavBase64, "base64") : undefined,
-          context: { recentEvents: runtime.recentEvents },
-        });
-      } catch (error) {
-        socket.emit("playback:error", {
-          message: error instanceof Error ? error.message : "Realtime inference failed",
-        });
-        socket.emit("playback:window:done", {
-          epoch: window.epoch,
-          queued: runtime.pendingWindows.length,
-          durationMs: Date.now() - startedAt,
-        });
-        continue;
-      }
-
-      for (const candidate of candidates) {
-        const approved = decideCommentary(candidate);
-        if (!approved || runtime.epoch !== window.epoch || runtime.status !== "PLAYING") continue;
-        const startMs = window.startMs + Math.round(approved.startSeconds * 1000);
-        const endMs = window.startMs + Math.round(approved.endSeconds * 1000);
-        if (endMs > window.endMs + 2000) continue;
-        const dedupeKey = createHash("sha256")
-          .update([sessionId, window.epoch, approved.eventType, Math.round(startMs / 700)].join("|"))
-          .digest("hex");
-        const event = await prisma.playbackEvent.upsert({
-          where: { dedupeKey },
-          create: {
-            sessionId,
-            epoch: window.epoch,
-            dedupeKey,
-            eventType: approved.eventType,
-            startMs,
-            endMs,
-            commentaryText: approved.commentaryText,
-            confidence: approved.confidence,
-            visualEvidence: "Timestamped video frames analysed",
-            audioEvidence: window.audioWavBase64 ? "Original match audio analysed" : "Audio unavailable",
-            status: "DETECTED",
-          },
-          update: {},
-        });
-        if (event.status !== "DETECTED") continue;
-        runtime.recentEvents.push({
-          timestampMs: startMs,
-          eventType: approved.eventType,
-          summary: approved.observation,
-        });
-        runtime.recentEvents = runtime.recentEvents.slice(-12);
-        io.to(room(sessionId)).emit("commentary:event", {
-          eventId: event.id,
-          epoch: window.epoch,
-          startMs,
-          endMs,
-          eventType: approved.eventType,
-          commentaryText: approved.commentaryText,
-          confidence: approved.confidence,
-        });
-
-        runtime.ttsQueue = runtime.ttsQueue.then(async () => {
-          if (!runtimes.has(sessionId) || runtime.epoch !== window.epoch || runtime.status !== "PLAYING") {
-            await prisma.playbackEvent
-              .update({ where: { id: event.id }, data: { status: "SUPPRESSED" } })
-              .catch(() => undefined);
-            return;
-          }
-          let audio: Buffer;
-          try {
-            audio = await speak(approved.commentaryText, approved.emotion);
-          } catch (error) {
-            await prisma.playbackEvent
-              .update({ where: { id: event.id }, data: { status: "FAILED" } })
-              .catch(() => undefined);
-            const raw = error instanceof Error ? error.message : "Commentary voice synthesis failed";
-            const msg = raw.includes("429") || raw.includes("RESOURCE_EXHAUSTED")
-              ? "TTS voice quota limit reached; text commentary is still live."
-              : raw;
-            socket.emit("playback:error", { message: msg });
-            return;
-          }
-          const latest = await prisma.playbackSession.findUnique({ where: { id: sessionId } }).catch(() => null);
-          if (!latest || latest.status !== "PLAYING" || latest.epoch !== window.epoch || runtime.epoch !== window.epoch) {
-            await prisma.playbackEvent
-              .update({ where: { id: event.id }, data: { status: "SUPPRESSED" } })
-              .catch(() => undefined);
-            return;
-          }
-          await prisma.playbackEvent.update({ where: { id: event.id }, data: { status: "SPOKEN" } });
-          io.to(room(sessionId)).emit("commentary:audio", {
-            eventId: event.id,
-            epoch: window.epoch,
-            startMs,
-            endMs,
-            commentaryText: approved.commentaryText,
-            generatedAtMs: Date.now(),
-            audio,
-          });
-        });
-      }
-
-      socket.emit("playback:window:done", {
-        epoch: window.epoch,
-        queued: runtime.pendingWindows.length,
-        durationMs: Date.now() - startedAt,
-      });
-    }
-  } finally {
-    runtime.inFlight = false;
+function asBuffer(raw: unknown): Buffer | null {
+  if (Buffer.isBuffer(raw)) return raw;
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw);
+  if (ArrayBuffer.isView(raw)) {
+    return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
   }
+  return null;
+}
+
+function asJpeg(raw: unknown): Buffer | null {
+  if (typeof raw !== "string" || raw.length > Math.ceil(MAX_JPEG_BYTES * 4 / 3)) return null;
+  const value = Buffer.from(raw, "base64");
+  if (value.length < 16 || value.length > MAX_JPEG_BYTES) return null;
+  return value;
+}
+
+function classifyCommentary(text: string): string {
+  const t = text.toLowerCase();
+  if (/run.?out|run out|ran out|direct hit|runout/.test(t)) return "RUN_OUT";
+  if (/caught|catch|catches|lapak|pakad liya/.test(t)) return "CATCH";
+  if (/wicket|bowled|cleaned up|out ho gaye|ballebaaz out/.test(t)) return "WICKET";
+  if (/six|chhakka|छक्का/.test(t)) return "SIX";
+  if (/four|boundary|chauka|चौका/.test(t)) return "BOUNDARY_FOUR";
+  if (/appeal|how.?zat|shout for/.test(t)) return "APPEAL";
+  if (/single|one run|ek run/.test(t)) return "SINGLE";
+  if (/two runs|double|do run/.test(t)) return "TWO_RUNS";
+  if (/three runs|teen run/.test(t)) return "THREE_RUNS";
+  if (/dot ball|no run|koi run nahi/.test(t)) return "DOT_BALL";
+  if (/shot|drive|pull|cut|flick|sweep/.test(t)) return "SHOT";
+  return "LIVE_COMMENTARY";
+}
+
+function isCurrent(runtime: Runtime, generation: number, epoch: number): boolean {
+  return runtime.connectionGeneration === generation && runtime.epoch === epoch && runtime.status === "PLAYING";
+}
+
+function emitLiveError(io: Server, sessionId: string, message: string) {
+  io.to(room(sessionId)).emit("live:error", { message });
+}
+
+async function persistTranscript(sessionId: string, runtime: Runtime, io: Server) {
+  const text = runtime.transcript.replace(/\s+/g, " ").trim();
+  const startMs = runtime.transcriptStartMs;
+  const epoch = runtime.epoch;
+  runtime.transcript = "";
+  runtime.transcriptStartedAtMs = 0;
+  if (!text || text.length < 3) return;
+
+  const eventType = classifyCommentary(text);
+  const endMs = Math.max(startMs, runtime.positionMs);
+  const dedupeKey = createHash("sha256")
+    .update([sessionId, epoch, startMs, text.toLowerCase()].join("|"))
+    .digest("hex");
+  try {
+    const event = await prisma.playbackEvent.upsert({
+      where: { dedupeKey },
+      create: {
+        sessionId,
+        epoch,
+        dedupeKey,
+        eventType,
+        startMs,
+        endMs,
+        commentaryText: text,
+        confidence: 0.5,
+        visualEvidence: runtime.recentVision.slice(-4).map((item) => item.type).join(", ") || "No local vision signal",
+        audioEvidence: "Continuous original match audio analysed by Gemini Live",
+        status: "SPOKEN",
+      },
+      update: {},
+    });
+    io.to(room(sessionId)).emit("commentary:event", {
+      eventId: event.id,
+      epoch,
+      startMs,
+      endMs,
+      eventType,
+      commentaryText: text,
+      confidence: 0.5,
+    });
+  } catch (error) {
+    emitLiveError(io, sessionId, error instanceof Error ? error.message : "Could not persist live commentary event");
+  }
+}
+
+function scheduleReconnect(sessionId: string, runtime: Runtime, io: Server, requestedDelayMs = 0) {
+  if (runtime.status !== "PLAYING" || runtime.reconnectTimer || runtime.reconnectAttempts >= 10) return;
+  const exponential = Math.min(8_000, 500 * 2 ** runtime.reconnectAttempts);
+  const delayMs = Math.max(requestedDelayMs, exponential);
+  runtime.reconnectAttempts += 1;
+  runtime.reconnectTimer = setTimeout(() => {
+    runtime.reconnectTimer = undefined;
+    const old = runtime.live;
+    runtime.live = undefined;
+    runtime.connectionGeneration += 1;
+    old?.close();
+    void openLiveSession(sessionId, io).catch((error) => {
+      emitLiveError(io, sessionId, error instanceof Error ? error.message : "Gemini Live reconnect failed");
+      scheduleReconnect(sessionId, runtime, io);
+    });
+  }, delayMs);
+  runtime.reconnectTimer.unref?.();
+}
+
+async function openLiveSession(sessionId: string, io: Server): Promise<void> {
+  const runtime = runtimes.get(sessionId);
+  if (!runtime || runtime.status !== "PLAYING" || runtime.live || runtime.connecting) return;
+  runtime.connecting = true;
+  const generation = ++runtime.connectionGeneration;
+  const epoch = runtime.epoch;
+  try {
+    let sessionRecord = await prisma.playbackSession.findUnique({ where: { id: sessionId } });
+    if (!sessionRecord || sessionRecord.status !== "PLAYING" || sessionRecord.epoch !== epoch) return;
+
+    const connect = async (resumeHandle?: string | null) =>
+      connectGeminiLive({
+        resumeHandle,
+        callbacks: {
+          onAudio: (pcm24k) => {
+            if (!isCurrent(runtime, generation, epoch)) return;
+            runtime.audioSequence += 1;
+            io.to(room(sessionId)).emit("live:audio", {
+              epoch,
+              sequence: runtime.audioSequence,
+              sampleRate: 24_000,
+              matchPositionMs: runtime.positionMs,
+              generatedAtMs: Date.now(),
+              audio: pcm24k,
+            });
+          },
+          onText: (text) => {
+            if (!isCurrent(runtime, generation, epoch)) return;
+            if (!runtime.transcript) {
+              runtime.transcriptStartMs = runtime.positionMs;
+              runtime.transcriptStartedAtMs = Date.now();
+            }
+            runtime.transcript = (runtime.transcript + " " + text).replace(/\s+/g, " ").trim();
+            io.to(room(sessionId)).emit("live:transcript", {
+              epoch,
+              text,
+              fullText: runtime.transcript,
+              matchPositionMs: runtime.transcriptStartMs,
+              partial: true,
+            });
+          },
+          onGenerationComplete: () => {
+            if (!isCurrent(runtime, generation, epoch)) return;
+            void persistTranscript(sessionId, runtime, io);
+            io.to(room(sessionId)).emit("live:turn-complete", {
+              epoch,
+              matchPositionMs: runtime.positionMs,
+              completedAtMs: Date.now(),
+            });
+          },
+          onInterrupted: () => {
+            io.to(room(sessionId)).emit("live:interrupt", { epoch, reason: "model-interrupted" });
+          },
+          onResumptionUpdate: (handle, resumable) => {
+            if (runtime.connectionGeneration !== generation) return;
+            runtime.resumeHandle = resumable ? handle : undefined;
+            void prisma.playbackSession.update({
+              where: { id: sessionId },
+              data: {
+                liveSessionHandle: resumable ? handle : null,
+                liveSessionModel: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live",
+                liveHandleUpdatedAt: resumable ? new Date() : null,
+              },
+            }).catch((error) => emitLiveError(io, sessionId, error instanceof Error ? error.message : "Could not save session resume token"));
+          },
+          onGoAway: (timeLeftMs) => {
+            if (runtime.connectionGeneration !== generation || runtime.status !== "PLAYING") return;
+            // Reconnect before the server closes the connection; transparent resumption preserves unconsumed client messages.
+            scheduleReconnect(sessionId, runtime, io, Math.max(250, timeLeftMs - 1_000));
+          },
+          onError: (error) => {
+            if (runtime.connectionGeneration !== generation) return;
+            emitLiveError(io, sessionId, error.message);
+            scheduleReconnect(sessionId, runtime, io);
+          },
+          onClose: (reason) => {
+            if (runtime.connectionGeneration !== generation) return;
+            runtime.live = undefined;
+            if (runtime.status === "PLAYING") {
+              io.to(room(sessionId)).emit("live:status", { state: "reconnecting", reason });
+              scheduleReconnect(sessionId, runtime, io);
+            }
+          },
+        },
+      });
+
+    let connection: GeminiLiveConnection;
+    try {
+      connection = await connect(sessionRecord.liveSessionHandle ?? runtime.resumeHandle);
+    } catch (error) {
+      const handle = sessionRecord.liveSessionHandle ?? runtime.resumeHandle;
+      if (!handle) throw error;
+      // An expired/invalid handle should not permanently block a fresh session.
+      runtime.resumeHandle = undefined;
+      await prisma.playbackSession.update({
+        where: { id: sessionId },
+        data: { liveSessionHandle: null, liveHandleUpdatedAt: null },
+      }).catch(() => undefined);
+      connection = await connect(null);
+    }
+
+    if (!isCurrent(runtime, generation, epoch)) {
+      connection.close();
+      return;
+    }
+    runtime.live = connection;
+    runtime.reconnectAttempts = 0;
+    if (runtime.reconnectTimer) clearTimeout(runtime.reconnectTimer);
+    runtime.reconnectTimer = undefined;
+    io.to(room(sessionId)).emit("live:status", {
+      state: "connected",
+      model: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live",
+      epoch,
+      resumed: Boolean(sessionRecord.liveSessionHandle ?? runtime.resumeHandle),
+    });
+    connection.sendContext(
+      `Live match commentary started at match clock ${Math.floor(runtime.positionMs / 60_000)}:${String(Math.floor(runtime.positionMs / 1000) % 60).padStart(2, "0")}. The incoming audio is the original match feed, not a microphone.`,
+    );
+  } finally {
+    runtime.connecting = false;
+  }
+}
+
+function validMediaPayload(payload: unknown): payload is { timestampMs: number; jpegBase64: string } {
+  if (!payload || typeof payload !== "object") return false;
+  const value = payload as { timestampMs?: unknown; jpegBase64?: unknown };
+  return Number.isInteger(value.timestampMs) && Number(value.timestampMs) >= 0 &&
+    typeof value.jpegBase64 === "string" && value.jpegBase64.length >= 16;
+}
+
+function sendVisionContext(
+  sessionId: string,
+  runtime: Runtime,
+  io: Server,
+  result: VisionFrameResult,
+) {
+  if (!result.candidateEvents.length) return;
+  runtime.recentVision.push(
+    ...result.candidateEvents.map((event) => ({
+      timestampMs: result.timestampMs,
+      type: event.type,
+      confidence: event.confidence,
+      evidence: event.evidence,
+    })),
+  );
+  runtime.recentVision = runtime.recentVision.slice(-12);
+  io.to(room(sessionId)).emit("live:vision", {
+    epoch: runtime.epoch,
+    timestampMs: result.timestampMs,
+    inferenceMs: result.inferenceMs,
+    objects: result.objects,
+    candidateEvents: result.candidateEvents,
+  });
+
+  const strongest = result.candidateEvents.reduce((best, item) => item.confidence > best.confidence ? item : best);
+  if (Date.now() - runtime.lastVisionSignalAt < 650 || !runtime.live) return;
+  runtime.lastVisionSignalAt = Date.now();
+  runtime.live.sendContext(
+    `LOCAL VISUAL CANDIDATE at match time ${(result.timestampMs / 1000).toFixed(2)}s: ${strongest.type} (weak detector confidence ${strongest.confidence.toFixed(2)}). Evidence: ${JSON.stringify(strongest.evidence ?? {})}. Treat this only as a candidate; corroborate with the continuous match audio and do not claim a wicket, catch, run or boundary without sufficient evidence.`,
+  );
 }
 
 export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
@@ -185,7 +353,7 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     const session = await prisma.playbackSession.create({
       data: { videoId, status: "READY", currentPositionMs: positionMs, epoch: 0 },
     });
-    runtimeFor(session.id, 0, "READY");
+    runtimeFor(session.id, 0, "READY", positionMs);
     return reply.code(201).send(session);
   });
 
@@ -196,20 +364,35 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     return session;
   });
 
+  app.post("/v1/playback-sessions/:id/live/start", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const session = await prisma.playbackSession.findUnique({ where: { id } });
+    if (!session || session.status === "STOPPED") return reply.code(404).send({ error: "Active playback session not found" });
+    if (session.status !== "PLAYING") return reply.code(409).send({ error: "Resume playback before starting Gemini Live" });
+    const runtime = runtimeFor(id, session.epoch, "PLAYING", session.currentPositionMs);
+    try {
+      await openLiveSession(id, io);
+      return { connected: Boolean(runtime.live), model: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live" };
+    } catch (error) {
+      return reply.code(503).send({ error: error instanceof Error ? error.message : "Could not start Gemini Live session" });
+    }
+  });
+
   app.post("/v1/playback-sessions/:id/pause", async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = (req.body ?? {}) as { positionMs?: number };
     const current = await prisma.playbackSession.findUnique({ where: { id } });
     if (!current || current.status === "STOPPED") return reply.code(404).send({ error: "Active session not found" });
-    const positionMs =
-      Number.isInteger(body.positionMs) && (body.positionMs ?? -1) >= 0
-        ? body.positionMs!
-        : current.currentPositionMs;
+    const positionMs = Number.isInteger(body.positionMs) && (body.positionMs ?? -1) >= 0
+      ? body.positionMs!
+      : current.currentPositionMs;
     const updated = await prisma.playbackSession.update({
       where: { id },
       data: { status: "PAUSED", currentPositionMs: positionMs, pausedAt: new Date(), lastHeartbeatAt: new Date() },
     });
-    runtimeFor(id, updated.epoch, "PAUSED");
+    const runtime = runtimeFor(id, updated.epoch, "PAUSED", positionMs);
+    runtime.transcript = "";
+    io.to(room(id)).emit("live:interrupt", { epoch: updated.epoch, reason: "playback-paused" });
     io.to(room(id)).emit("playback:control", { type: "PAUSE", positionMs, epoch: updated.epoch });
     return updated;
   });
@@ -222,12 +405,8 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
       where: { id },
       data: { status: "PLAYING", pausedAt: null, lastHeartbeatAt: new Date() },
     });
-    runtimeFor(id, updated.epoch, "PLAYING");
-    io.to(room(id)).emit("playback:control", {
-      type: "PLAY",
-      positionMs: updated.currentPositionMs,
-      epoch: updated.epoch,
-    });
+    const runtime = runtimeFor(id, updated.epoch, "PLAYING", updated.currentPositionMs);
+    io.to(room(id)).emit("playback:control", { type: "PLAY", positionMs: updated.currentPositionMs, epoch: updated.epoch });
     return updated;
   });
 
@@ -239,16 +418,32 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     }
     const current = await prisma.playbackSession.findUnique({ where: { id } });
     if (!current || current.status === "STOPPED") return reply.code(404).send({ error: "Active session not found" });
+    const runtime = runtimes.get(id);
+    if (runtime?.reconnectTimer) clearTimeout(runtime.reconnectTimer);
+    if (runtime) {
+      runtime.reconnectTimer = undefined;
+      runtime.status = "PAUSED";
+      runtime.connectionGeneration += 1;
+      runtime.live?.close();
+      runtime.live = undefined;
+      runtime.resumeHandle = undefined;
+      runtime.transcript = "";
+      runtime.recentVision = [];
+    }
     const updated = await prisma.playbackSession.update({
       where: { id },
-      data: { currentPositionMs: body.positionMs!, epoch: { increment: 1 }, lastHeartbeatAt: new Date() },
+      data: {
+        currentPositionMs: body.positionMs!,
+        epoch: { increment: 1 },
+        lastHeartbeatAt: new Date(),
+        liveSessionHandle: null,
+        liveHandleUpdatedAt: null,
+      },
     });
-    runtimeFor(id, updated.epoch, current.status as Status);
-    io.to(room(id)).emit("playback:control", {
-      type: "SEEK",
-      positionMs: updated.currentPositionMs,
-      epoch: updated.epoch,
-    });
+    runtimeFor(id, updated.epoch, current.status as Status, updated.currentPositionMs);
+    io.to(room(id)).emit("live:interrupt", { epoch: updated.epoch, reason: "playback-seeked" });
+    io.to(room(id)).emit("playback:control", { type: "SEEK", positionMs: updated.currentPositionMs, epoch: updated.epoch });
+    await clearVisionSession(id);
     return updated;
   });
 
@@ -256,63 +451,121 @@ export function registerRealtimePlayback(app: FastifyInstance, io: Server) {
     const { id } = req.params as { id: string };
     const current = await prisma.playbackSession.findUnique({ where: { id } });
     if (!current) return reply.code(404).send({ error: "Playback session not found" });
+    const runtime = runtimes.get(id);
+    if (runtime?.reconnectTimer) clearTimeout(runtime.reconnectTimer);
+    if (runtime) {
+      runtime.status = "STOPPED";
+      runtime.connectionGeneration += 1;
+      runtime.live?.close();
+      runtimes.delete(id);
+    }
     const updated = await prisma.playbackSession.update({
       where: { id },
-      data: { status: "STOPPED", endedAt: new Date() },
+      data: { status: "STOPPED", endedAt: new Date(), liveSessionHandle: null, liveHandleUpdatedAt: null },
     });
-    runtimeFor(id, updated.epoch, "STOPPED");
+    io.to(room(id)).emit("live:interrupt", { epoch: updated.epoch, reason: "playback-stopped" });
     io.to(room(id)).emit("playback:control", { type: "STOP", epoch: updated.epoch });
-    runtimes.delete(id);
+    await clearVisionSession(id);
     return updated;
   });
 
   io.on("connection", (socket: Socket) => {
     const sessionId = typeof socket.handshake.auth?.sessionId === "string" ? socket.handshake.auth.sessionId : "";
-    if (!sessionId) return;
-    void prisma.playbackSession
-      .findUnique({ where: { id: sessionId } })
-      .then((session) => {
-        if (!session || session.status === "STOPPED") {
-          socket.disconnect(true);
-          return;
-        }
-        runtimeFor(session.id, session.epoch, session.status as Status);
-        socket.join(room(session.id));
-        socket.emit("playback:ready", {
-          sessionId,
-          epoch: session.epoch,
-          status: session.status,
-          currentPositionMs: session.currentPositionMs,
-        });
-      })
-      .catch(() => socket.disconnect(true));
+    if (!sessionId) {
+      socket.disconnect(true);
+      return;
+    }
 
-    socket.on("media:window", async (raw: unknown, ack?: (result: unknown) => void) => {
-      const session = await prisma.playbackSession.findUnique({ where: { id: sessionId } }).catch(() => null);
-      const runtime = session ? runtimeFor(session.id, session.epoch, session.status as Status) : null;
-      if (!session || !runtime || session.status !== "PLAYING" || runtime.status !== "PLAYING") {
-        ack?.({ accepted: false, reason: "Session is not playing" });
+    void prisma.playbackSession.findUnique({ where: { id: sessionId } }).then((session) => {
+      if (!session || session.status === "STOPPED") {
+        socket.disconnect(true);
         return;
       }
-      const parsed = realtimeWindowSchema.safeParse(raw);
-      if (!parsed.success) {
-        ack?.({ accepted: false, reason: "Invalid media window", details: parsed.error.flatten() });
-        return;
+      const runtime = runtimeFor(session.id, session.epoch, session.status as Status, session.currentPositionMs);
+      socket.join(room(session.id));
+      socket.emit("playback:ready", {
+        sessionId,
+        epoch: session.epoch,
+        status: session.status,
+        currentPositionMs: session.currentPositionMs,
+      });
+      socket.emit("live:status", { state: runtime.live ? "connected" : "idle", model: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live" });
+    }).catch(() => socket.disconnect(true));
+
+    socket.on("live:audio", (raw: unknown) => {
+      const runtime = runtimes.get(sessionId);
+      if (!runtime || runtime.status !== "PLAYING" || !runtime.live) return;
+      const pcm = asBuffer(raw);
+      if (!pcm || pcm.length < 160 || pcm.length > MAX_AUDIO_CHUNK_BYTES || pcm.length % 2 !== 0) return;
+      runtime.lastAudioInputAt = Date.now();
+      try {
+        runtime.live.sendAudio(pcm);
+      } catch (error) {
+        emitLiveError(io, sessionId, error instanceof Error ? error.message : "Could not forward match audio");
       }
-      const window = parsed.data;
-      if (window.epoch !== session.epoch || window.epoch !== runtime.epoch) {
-        ack?.({ accepted: false, reason: "Stale playback epoch" });
-        return;
+    });
+
+    socket.on("live:video", (payload: unknown) => {
+      const runtime = runtimes.get(sessionId);
+      if (!runtime || runtime.status !== "PLAYING" || !runtime.live || !validMediaPayload(payload)) return;
+      const jpeg = asJpeg(payload.jpegBase64);
+      if (!jpeg) return;
+      if (Date.now() - runtime.lastGeminiVideoAt < GEMINI_VIDEO_INTERVAL_MS) return;
+      runtime.lastGeminiVideoAt = Date.now();
+      try {
+        runtime.live.sendContext(`Visual context frame at match time ${(payload.timestampMs / 1000).toFixed(2)} seconds.`);
+        runtime.live.sendVideo(jpeg);
+      } catch (error) {
+        emitLiveError(io, sessionId, error instanceof Error ? error.message : "Could not forward visual context");
       }
-      if (runtime.pendingWindows.length >= MAX_PENDING_WINDOWS) {
-        runtime.pendingWindows.shift();
+    });
+
+    socket.on("live:vision-frame", async (payload: unknown) => {
+      const runtime = runtimes.get(sessionId);
+      if (!runtime || runtime.status !== "PLAYING" || runtime.visionBusy || !validMediaPayload(payload)) return;
+      if (Date.now() - runtime.lastVisionAt < VISION_MIN_INTERVAL_MS) return;
+      const jpeg = asJpeg(payload.jpegBase64);
+      if (!jpeg) return;
+      runtime.visionBusy = true;
+      runtime.lastVisionAt = Date.now();
+      try {
+        const result = await analyzeCricketFrame(sessionId, payload.timestampMs, jpeg);
+        if (result && runtime.status === "PLAYING") sendVisionContext(sessionId, runtime, io, result);
+      } catch (error) {
+        socket.emit("live:vision-status", {
+          available: false,
+          message: error instanceof Error ? error.message : "Local vision service unavailable",
+        });
+      } finally {
+        runtime.visionBusy = false;
       }
-      runtime.pendingWindows.push({ socket, window });
-      await prisma.playbackSession
-        .update({ where: { id: sessionId }, data: { currentPositionMs: window.endMs, lastHeartbeatAt: new Date() } })
-        .catch(() => undefined);
-      ack?.({ accepted: true, queued: runtime.inFlight ? runtime.pendingWindows.length : 0 });
-      void drainWindows(sessionId, io);
+    });
+
+    socket.on("live:sync", (payload: unknown) => {
+      const runtime = runtimes.get(sessionId);
+      if (!runtime || !payload || typeof payload !== "object") return;
+      const value = payload as { positionMs?: unknown; playbackRate?: unknown; playing?: unknown };
+      if (Number.isInteger(value.positionMs) && Number(value.positionMs) >= 0) {
+        runtime.positionMs = Number(value.positionMs);
+      }
+      if (typeof value.playbackRate === "number" && Number.isFinite(value.playbackRate)) {
+        runtime.playbackRate = Math.min(2, Math.max(0.25, value.playbackRate));
+      }
+      if (Date.now() - runtime.lastDatabaseSyncAt > 3_000) {
+        runtime.lastDatabaseSyncAt = Date.now();
+        void prisma.playbackSession.update({
+          where: { id: sessionId },
+          data: { currentPositionMs: runtime.positionMs, lastHeartbeatAt: new Date() },
+        }).catch(() => undefined);
+      }
+    });
+
+    socket.on("disconnect", () => {
+      // Keep the server-side Live session alive briefly so a transient browser reconnect can resume the same match context.
+      const runtime = runtimes.get(sessionId);
+      if (runtime && runtime.status === "PLAYING") {
+        io.to(room(sessionId)).emit("live:status", { state: "client-disconnected" });
+      }
     });
   });
 }
