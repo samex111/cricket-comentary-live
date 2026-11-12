@@ -27,6 +27,18 @@ type LiveAudioMessage = {
 };
 type LiveStatus = "READY" | "PLAYING" | "PAUSED" | "STOPPED" | "CONNECTING" | "RECONNECTING" | "FAILED";
 type WorkletMessage = { type: "audio"; pcm: ArrayBuffer };
+type LiveMetrics = {
+  epoch: number;
+  uptimeMs: number;
+  audioChunksIn: number;
+  audioBytesIn: number;
+  geminiVideoFramesIn: number;
+  visionFramesIn: number;
+  visionCandidates: number;
+  visionInferenceMsLast: number;
+  audioChunksOut: number;
+  reconnects: number;
+};
 
 const clock = (ms: number) => {
   const seconds = Math.floor(ms / 1000);
@@ -83,6 +95,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
   const [error, setError] = useState("");
   const [visionStatus, setVisionStatus] = useState("Checking local vision detector");
   const [audioLatencyMs, setAudioLatencyMs] = useState<number | null>(null);
+  const [metrics, setMetrics] = useState<LiveMetrics | null>(null);
 
   const setLiveStatus = useCallback((next: LiveStatus) => {
     statusRef.current = next;
@@ -183,6 +196,9 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
           } else if (data.state === "idle") {
             setMessage("Ready to start Gemini Live");
           }
+        });
+        socket.on("live:metrics", (event: LiveMetrics) => {
+          if (event.epoch === epochRef.current) setMetrics(event);
         });
         socket.on("live:audio", (event: LiveAudioMessage) => {
           if (event.epoch !== epochRef.current || statusRef.current !== "PLAYING") return;
@@ -400,6 +416,13 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
         <span>{visionStatus}</span>
         <span>Audio input: PCM16 / 16 kHz / 40 ms</span>
         <span>Gemini video: max 1 FPS</span>
+        {metrics && (
+          <span>
+            Stream: {metrics.audioChunksIn} audio chunks in · {metrics.audioChunksOut} out ·
+            {metrics.geminiVideoFramesIn} Gemini frames · {metrics.visionFramesIn} vision frames ·
+            {metrics.reconnects} reconnects
+          </span>
+        )}
       </div>
 
       {error && <p className="rounded-lg border border-amber-900 bg-amber-950/30 p-3 text-xs text-amber-200">{error}</p>}
