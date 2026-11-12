@@ -23,6 +23,8 @@ export async function analyzeCricketFrame(
   const baseUrl = process.env.VISION_SERVICE_URL?.trim();
   if (!baseUrl) return null;
   const timeoutMs = Math.max(150, Number(process.env.VISION_REQUEST_TIMEOUT_MS ?? 900));
+  const body = new ArrayBuffer(jpeg.byteLength);
+  new Uint8Array(body).set(jpeg);
   const response = await fetch(baseUrl.replace(/\/$/, "") + "/detect", {
     method: "POST",
     headers: {
@@ -31,7 +33,7 @@ export async function analyzeCricketFrame(
       "x-timestamp-ms": String(timestampMs),
       ...(process.env.VISION_SERVICE_KEY ? { "x-vision-key": process.env.VISION_SERVICE_KEY } : {}),
     },
-    body: jpeg,
+    body,
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
