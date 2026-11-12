@@ -259,6 +259,11 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     const socket = socketRef.current;
     if (!video || !socket) return;
     let frameHandle = 0;
+    const frameApi = video as unknown as {
+      requestVideoFrameCallback?: (callback: (now: number, metadata: { mediaTime: number }) => void) => number;
+      cancelVideoFrameCallback?: (handle: number) => void;
+    };
+    const supportsFrameCallbacks = typeof frameApi.requestVideoFrameCallback === "function";
     let lastVisionCaptureAt = -1_000;
     let lastGeminiCaptureAt = -1_000;
 
@@ -290,10 +295,10 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
 
     const onFrame = (_now: number, metadata: { mediaTime: number }) => {
       captureFrame(Math.round(metadata.mediaTime * 1000));
-      if (video.requestVideoFrameCallback) frameHandle = video.requestVideoFrameCallback(onFrame);
+      if (supportsFrameCallbacks) frameHandle = frameApi.requestVideoFrameCallback!(onFrame);
     };
-    if (video.requestVideoFrameCallback) frameHandle = video.requestVideoFrameCallback(onFrame);
-    const fallbackTimer = video.requestVideoFrameCallback ? null : window.setInterval(() => {
+    if (supportsFrameCallbacks) frameHandle = frameApi.requestVideoFrameCallback!(onFrame);
+    const fallbackTimer = supportsFrameCallbacks ? null : window.setInterval(() => {
       if (!video.paused) captureFrame(Math.round(video.currentTime * 1000));
     }, 100);
     const syncTimer = window.setInterval(() => {
@@ -305,7 +310,7 @@ export function LivePlayer({ videoId, title }: { videoId: string; title: string 
     }, 250);
 
     return () => {
-      if (frameHandle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameHandle);
+      if (frameHandle && frameApi.cancelVideoFrameCallback) frameApi.cancelVideoFrameCallback(frameHandle);
       if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
       window.clearInterval(syncTimer);
     };
